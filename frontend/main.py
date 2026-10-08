@@ -31,19 +31,12 @@ import google.auth
 import google.auth.transport.requests
 import httpx
 from a2a.client import ClientConfig, ClientFactory
-from a2a.types import (
-    AgentCard,
-    FilePart,
-    Message,
-    Part,
-    Role,
-    TaskArtifactUpdateEvent,
-    TextPart,
-    TransportProtocol,
-)
+from a2a.client.client_factory import TransportProtocol
+from a2a.types import AgentCard, Message, Part, Role, SendMessageRequest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from google.protobuf.json_format import MessageToDict, ParseDict
 
 # Load .env if present
 _env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -94,10 +87,6 @@ app = FastAPI()
 
 @app.exception_handler(Exception)
 async def _json_errors(request: Request, exc: Exception):
-    # Always return JSON so the browser never receives a plain-text 500 page
-    # (which shows up in the chat as "Unexpected token 'I', "Internal S"... is
-    # not valid JSON"). Any server-side failure now surfaces as a readable
-    # message in the chat bubble instead.
     return JSONResponse(
         status_code=200,
         content={
@@ -117,36 +106,26 @@ async def _get_card(client: httpx.AsyncClient) -> AgentCard:
     if _card is None:
         resp = await client.get(A2A_CARD_URL)
         resp.raise_for_status()
-        card = AgentCard(**resp.json())
-        # Agent Runtime does not serve a public card URL, so point the client at
-        # the passthrough base for message sends.
-        card.url = A2A_BASE
+        card = AgentCard()
+        ParseDict(resp.json(), card, ignore_unknown_fields=True)
         _card = card
     return _card
 
 
-def _extract_parts(parts: list) -> list[dict]:
-    """Turn A2A response parts into structured parts for the chat UI.
-
-    Text parts pass through as {"kind": "text"}. A2UI data parts (tagged
-    application/json+a2ui) become {"kind": "a2ui", "data": <message>} so the UI
-    renders the card; each data part is one A2UI message (beginRendering or
-    surfaceUpdate).
-    """
+def _extract_parts_from_dict(parts: list[dict]) -> list[dict]:
     out: list[dict] = []
     for p in parts:
-        root = getattr(p, "root", p)
-        if isinstance(root, TextPart) and getattr(root, "text", None):
-            out.append({"kind": "text", "text": root.text})
-        elif getattr(root, "data", None) is not None:
-            meta = getattr(root, "metadata", None) or {}
+        if not isinstance(p, dict):
+            continue
+        if "text" in p and p["text"]:
+            out.append({"kind": "text", "text": p["text"]})
+        elif "data" in p and p["data"] is not None:
+            meta = p.get("metadata") or {}
             mime = meta.get("mimeType") if isinstance(meta, dict) else None
             if mime == _A2UI_MIME:
-                out.append({"kind": "a2ui", "data": root.data})
-        elif isinstance(root, FilePart):
-            uri = getattr(getattr(root, "file", None), "uri", None)
-            if uri:
-                out.append({"kind": "text", "text": uri})
+                out.append({"kind": "a2ui", "data": p["data"]})
+        elif "url" in p and p["url"]:
+            out.append({"kind": "text", "text": p["url"]})
     return out
 
 
@@ -161,10 +140,7 @@ async def chat(req: Request):
         card = await _get_card(client)
         factory = ClientFactory(
             ClientConfig(
-                supported_transports=[
-                    TransportProtocol.jsonrpc,
-                    TransportProtocol.http_json,
-                ],
+                supported_protocol_bindings=[TransportProtocol.JSONRPC],
                 httpx_client=client,
             )
         )
@@ -172,35 +148,50 @@ async def chat(req: Request):
 
         msg = Message(
             message_id=str(uuid.uuid4()),
-            role=Role.user,
-            parts=[Part(root=TextPart(text=message))],
-            context_id=_contexts.get(user_id),
+            role=Role.ROLE_USER,
+            parts=[Part(text=message)],
+            context_id=_contexts.get(user_id, ""),
         )
+        req_msg = SendMessageRequest(message=msg)
 
-        last_task = None
-        got_artifact_update = False
-        async for event in a2a_client.send_message(msg):
-            if not isinstance(event, tuple):
-                continue
-            task, update = event
-            if task is not None:
-                last_task = task
-                if getattr(task, "context_id", None):
-                    _contexts[user_id] = task.context_id
-            if isinstance(update, TaskArtifactUpdateEvent):
-                got_artifact_update = True
-                parts.extend(_extract_parts(update.artifact.parts))
+        async for stream_resp in a2a_client.send_message(req_msg):
+            resp_dict = MessageToDict(stream_resp, preserving_proto_field_name=False)
+            
+            # Check for context updates
+            task_info = resp_dict.get("task") or resp_dict.get("statusUpdate") or resp_dict.get("artifactUpdate")
+            if task_info and "contextId" in task_info and task_info["contextId"]:
+                _contexts[user_id] = task_info["contextId"]
+                
+            # Check for artifact updates
+            if "artifactUpdate" in resp_dict:
+                artifact = resp_dict["artifactUpdate"].get("artifact", {})
+                parts.extend(_extract_parts_from_dict(artifact.get("parts", [])))
+                
+            # Check for direct message parts in statusUpdate
+            if "statusUpdate" in resp_dict:
+                status_msg = resp_dict["statusUpdate"].get("message", {})
+                if status_msg and "parts" in status_msg:
+                    # Filter out tool execution internals if desired
+                    for p in status_msg.get("parts", []):
+                        if "text" in p and p["text"]:
+                            parts.append({"kind": "text", "text": p["text"]})
+                        elif "data" in p:
+                            meta = p.get("metadata", {})
+                            if meta.get("mimeType") == _A2UI_MIME:
+                                parts.append({"kind": "a2ui", "data": p["data"]})
 
-        # Non-streaming fallback: pull parts from the final task's artifacts.
-        if not got_artifact_update and last_task is not None:
-            for artifact in getattr(last_task, "artifacts", None) or []:
-                parts.extend(_extract_parts(artifact.parts))
+    # Deduplicate consecutive identical text replies if streaming yielded duplicates
+    filtered_parts: list[dict] = []
+    seen = set()
+    for p in parts:
+        sig = (p.get("kind"), str(p.get("text") or p.get("data")))
+        if sig not in seen:
+            seen.add(sig)
+            filtered_parts.append(p)
 
-    if not parts:
-        # The turn produced no text or UI (e.g. the agent only ran tools, or a
-        # tool stalled). Be honest rather than silent.
-        parts = [{"kind": "text", "text": "(The agent didn't return a reply.)"}]
-    return JSONResponse({"parts": parts})
+    if not filtered_parts:
+        filtered_parts = [{"kind": "text", "text": "(The agent didn't return a reply.)"}]
+    return JSONResponse({"parts": filtered_parts})
 
 
 # Serve the chat UI (keep this mount last so /chat wins).

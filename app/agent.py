@@ -19,18 +19,26 @@ import os
 from google.cloud import firestore
 
 from google.adk.agents import Agent
+from google.adk.agents.callback_context import CallbackContext
 from google.adk.apps import App
 from google.adk.code_executors import AgentEngineSandboxCodeExecutor
+from google.adk.memory.vertex_ai_memory_bank_service import VertexAiMemoryBankService
 from google.adk.models import Gemini
 from google.adk.tools import ToolContext
+from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 from google.genai import types
 
-from a2ui.schema.manager import A2uiSchemaManager
-from a2ui.basic_catalog.provider import BasicCatalog
 from .a2ui_utils import a2ui_callback
 
+try:
+    from a2ui.schema.manager import A2uiSchemaManager
+    from a2ui.basic_catalog.provider import BasicCatalog
+    _HAS_A2UI_SDK = True
+except ImportError:
+    _HAS_A2UI_SDK = False
 
-MODEL = "gemini-3.8-flash"
+
+MODEL = "gemini-2.5-flash"
 PROJECT_ID = "qwiklabs-gcp-03-99d8dc84aabc"
 
 
@@ -357,49 +365,75 @@ sandbox_code_executor = (
 )
 
 # Build A2UI System Prompt using A2uiSchemaManager (version 0.8) & Basic Catalog
-schema_manager = A2uiSchemaManager(
-    version="0.8",
-    catalogs=[BasicCatalog.get_config("0.8")],
-)
+_prompt_path = os.path.join(os.path.dirname(__file__), "a2ui_prompt.txt")
+if os.path.exists(_prompt_path):
+    with open(_prompt_path, "r", encoding="utf-8") as f:
+        instruction = f.read()
+elif _HAS_A2UI_SDK:
+    schema_manager = A2uiSchemaManager(
+        version="0.8",
+        catalogs=[BasicCatalog.get_config("0.8")],
+    )
+    instruction = schema_manager.generate_system_prompt(
+        role_description=(
+            "You are AlphaHedge, an autonomous AI Paper Stock Trading and Portfolio Management Agent. "
+            "Your mission is to help the user maximize simulated profits and beat market benchmark indices (e.g. S&P 500 / SPY). "
+            "You have direct access to: "
+            "1. Live market quotes (`fetch_live_stock_quote`) to check real-time stock prices. "
+            "2. Real-time market news (`fetch_live_market_news`) to analyze sentiment, catalysts, and breaking headlines. "
+            "3. Portfolio Firestore database (`get_portfolio_holdings`, `get_account_summary`) to inspect positions and cash. "
+            "4. Paper order execution (`execute_paper_trade`) to execute simulated buy/sell trades with clear analytical rationale. "
+            "5. Image generation (`generate_trading_visual`) to create visual badges, charts, or milestones. "
+            "6. Sandbox Python code execution to safely run mathematical modeling, quantitative calculations, and data analysis. "
+            "When executing or automating trades: "
+            "- For trades whose total value is <= 10% of the portfolio, execute them automatically. "
+            "- CRITICAL SAFETY RULE: If a proposed trade exceeds 10% of total portfolio value (or if `execute_paper_trade` returns an APPROVAL REQUIRED message), "
+            "STOP immediately, present the trade details (ticker, action, shares, price, trade value, and % of portfolio) to the user, and ask for their explicit confirmation. "
+            "- Only call `execute_paper_trade` with `user_confirmed=True` AFTER the user has explicitly confirmed their approval in their message."
+        ),
+        workflow_description="Analyze market data, portfolio state, and trading requests, and return structured A2UI cards for visual representation.",
+        ui_description=(
+            "Keep every surface tiny and flat: ONE Card > ONE Column > a few Text rows. "
+            "Never nest a Card inside a Card. "
+            "Use ONLY these components: Card, Column, Row, Text, and Image. Do not use "
+            "Table or Heading (unsupported), or Buttons, actions, or forms (they do "
+            "nothing in adk web). "
+            "You may include one Image component, but only when you have a public https "
+            "URL for the image (for example the URL an image tool returns after uploading "
+            "to a public bucket). Set the Image url to that exact https link, for example "
+            "{\"Image\": {\"url\": {\"literalString\": \"https://...\"}}}. Never point an "
+            "Image at a bare filename, an artifact name, or a non-http(s) path. If you do "
+            "not have a public URL, add a short Text line noting the image instead. "
+            "No markdown in text; use the usageHint property ('h1', 'h2', 'body') for "
+            "headings and emphasis. "
+            "Output ONLY the raw A2UI JSON array — no prose, and never wrap it in "
+            "<a2a_datapart_json> tags or 'kind'/'data'/'metadata' objects."
+        ),
+        include_schema=True,
+        include_examples=True,
+    )
+else:
+    instruction = (
+        "You are AlphaHedge, an autonomous AI Paper Stock Trading and Portfolio Management Agent."
+    )
 
-instruction = schema_manager.generate_system_prompt(
-    role_description=(
-        "You are AlphaHedge, an autonomous AI Paper Stock Trading and Portfolio Management Agent. "
-        "Your mission is to help the user maximize simulated profits and beat market benchmark indices (e.g. S&P 500 / SPY). "
-        "You have direct access to: "
-        "1. Live market quotes (`fetch_live_stock_quote`) to check real-time stock prices. "
-        "2. Real-time market news (`fetch_live_market_news`) to analyze sentiment, catalysts, and breaking headlines. "
-        "3. Portfolio Firestore database (`get_portfolio_holdings`, `get_account_summary`) to inspect positions and cash. "
-        "4. Paper order execution (`execute_paper_trade`) to execute simulated buy/sell trades with clear analytical rationale. "
-        "5. Image generation (`generate_trading_visual`) to create visual badges, charts, or milestones. "
-        "6. Sandbox Python code execution to safely run mathematical modeling, quantitative calculations, and data analysis. "
-        "When executing or automating trades: "
-        "- For trades whose total value is <= 10% of the portfolio, execute them automatically. "
-        "- CRITICAL SAFETY RULE: If a proposed trade exceeds 10% of total portfolio value (or if `execute_paper_trade` returns an APPROVAL REQUIRED message), "
-        "STOP immediately, present the trade details (ticker, action, shares, price, trade value, and % of portfolio) to the user, and ask for their explicit confirmation. "
-        "- Only call `execute_paper_trade` with `user_confirmed=True` AFTER the user has explicitly confirmed their approval in their message."
-    ),
-    workflow_description="Analyze market data, portfolio state, and trading requests, and return structured A2UI cards for visual representation.",
-    ui_description=(
-        "Keep every surface tiny and flat: ONE Card > ONE Column > a few Text rows. "
-        "Never nest a Card inside a Card. "
-        "Use ONLY these components: Card, Column, Row, Text, and Image. Do not use "
-        "Table or Heading (unsupported), or Buttons, actions, or forms (they do "
-        "nothing in adk web). "
-        "You may include one Image component, but only when you have a public https "
-        "URL for the image (for example the URL an image tool returns after uploading "
-        "to a public bucket). Set the Image url to that exact https link, for example "
-        "{\"Image\": {\"url\": {\"literalString\": \"https://...\"}}}. Never point an "
-        "Image at a bare filename, an artifact name, or a non-http(s) path. If you do "
-        "not have a public URL, add a short Text line noting the image instead. "
-        "No markdown in text; use the usageHint property ('h1', 'h2', 'body') for "
-        "headings and emphasis. "
-        "Output ONLY the raw A2UI JSON array — no prose, and never wrap it in "
-        "<a2a_datapart_json> tags or 'kind'/'data'/'metadata' objects."
-    ),
-    include_schema=True,
-    include_examples=True,
-)
+
+async def generate_memories_callback(callback_context: CallbackContext):
+    """WRITE: after each turn, send the session to Memory Bank for extraction."""
+    await callback_context.add_session_to_memory()
+    return None
+
+
+MEMORY_BANK_ID = _agent_engine_id.split("/")[-1] if _agent_engine_id else "4335854834902106112"
+
+
+def memory_bank_service_builder():
+    """Provides the Vertex AI Memory Bank service when deployed on Agent Runtime."""
+    return VertexAiMemoryBankService(
+        project=PROJECT_ID,
+        location="us-east1",
+        agent_engine_id=MEMORY_BANK_ID,
+    )
 
 
 root_agent = Agent(
@@ -410,6 +444,7 @@ root_agent = Agent(
     ),
     instruction=instruction,
     tools=[
+        PreloadMemoryTool(),
         fetch_live_stock_quote,
         fetch_live_market_news,
         get_portfolio_holdings,
@@ -419,6 +454,7 @@ root_agent = Agent(
     ],
     code_executor=sandbox_code_executor,
     after_model_callback=a2ui_callback,
+    after_agent_callback=generate_memories_callback,
 )
 
 app = App(
